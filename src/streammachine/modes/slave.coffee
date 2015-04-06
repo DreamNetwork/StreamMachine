@@ -3,6 +3,7 @@ nconf   = require "nconf"
 cluster = require "cluster"
 path    = require "path"
 RPC     = require "ipc-rpc"
+net     = require "net"
 
 Logger  = require "../logger"
 Slave   = require "../slave"
@@ -72,7 +73,6 @@ module.exports = class SlaveMode extends require("./base")
                 w:          worker
                 rpc:        null
                 pid:        worker.process.pid
-                _listening: false
                 _loaded:    false
 
             w.rpc = new RPC worker, functions:
@@ -80,17 +80,17 @@ module.exports = class SlaveMode extends require("./base")
                 # triggered by the worker once it has its streams configured
                 # (though they may not yet have data to give out)
                 worker_configured: (msg,handle,cb) =>
-                    if @_haveHandle && !w._listening
-                        w.rpc.request "listen", {fd:@_handle?.fd}, (err,address) =>
-                            if err
-                                @log.error "Worker listen error: #{err}" if err
-                                return false
+                    #if @_haveHandle && !w._listening
+                    #    w.rpc.request "listen", {fd:@_handle?.fd}, (err,address) =>
+                    #        if err
+                    #            @log.error "Worker listen error: #{err}" if err
+                    #            return false
 
-                            w._listening = true
-                            @lWorkers[ w.id ] = w
-                            @_lastAddress = address
+                    #        w._listening = true
+                    #        @lWorkers[ w.id ] = w
+                    #        @_lastAddress = address
 
-                            @emit "worker_listening"
+                    #        @emit "worker_listening"
 
                     cb null
 
@@ -100,6 +100,8 @@ module.exports = class SlaveMode extends require("./base")
                 # tells us that it's safe to trigger a new worker launch
                 rewinds_loaded: (msg,handle,cb) =>
                     w._loaded = true
+                    @lWorkers[ w.id ] = w
+                    @emit "worker_loaded"
 
                     # ACK
                     cb null
@@ -156,15 +158,57 @@ module.exports = class SlaveMode extends require("./base")
 
         @_respawnWorkers()
 
-        # -- are we looking for a handoff? -- #
+        # -- set up server -- #
+
+        # We handle incoming connections here in the slave process, and then
+        # distribute them to our ready workers.
+
+        # If we're doing a handoff, we wait to receive a server handle from
+        # the sending process. If not, we should go ahead and start a server
+        # ourself.
 
         if nconf.get("handoff")
             @_acceptHandoff()
         else
             # we'll listen via our configured port
-            @_haveHandle = true
+            @_openServer null, cb
+
+    #----------
+
+    slavePort: ->
+        @_server?.address().port
+
+    #----------
+
+    _openServer: (handle,cb) ->
+        @_server = net.createServer pauseOnConnect:true, allowHalfOpen:true
+        @_server.listen handle || @opts.port, (err) =>
+            if err
+                @log.error "Failed to start slave server: #{err}"
+                throw err
+
+            @_server.on "connection", (conn) =>
+                @_distributeConnection conn
+
+            @log.info "Slave server is up and listening."
+
             cb? null, @
 
+    #----------
+
+    _distributeConnection: (conn) ->
+        worker_ids = Object.keys(@lWorkers)
+
+        if worker_ids.length == 0
+            @once "worker_loaded", =>
+                @_distributeConnection conn
+
+        else
+            id = _.sample worker_ids
+            @workers[id].rpc.request "connection", null, conn, (err) =>
+                if err
+                    @log.error "Failed to land incoming connection: #{err}"
+                    conn.destroy()
 
     #----------
 
@@ -254,80 +298,42 @@ module.exports = class SlaveMode extends require("./base")
 
         # Coordinate handing off our server handle
 
-        _send = (handle) =>
-            @_rpc.request "server_socket", {}, handle, (err) =>
-                if err
-                    @log.error "Error sending socket across handoff: #{err}"
-                    # FIXME: Proceed? Cancel?
+        @_rpc.request "server_socket", {}, @_server?._handle, (err) =>
+            if err
+                @log.error "Error sending socket across handoff: #{err}"
+                # FIXME: Proceed? Cancel?
 
-                @log.info "Server socket transferred. Sending listener connections."
+            @log.info "Server socket transferred. Sending listener connections."
 
-                # now we ask each worker to send its listeners. We proxy them through
-                # to the new process, which in turn hands them off to its workers
+            # now we ask each worker to send its listeners. We proxy them through
+            # to the new process, which in turn hands them off to its workers
 
-                _proxyWorker = (cb) =>
-                    # are we done yet?
-                    if Object.keys(cluster.workers).length == 0
-                        cb?()
-                        return false
+            _proxyWorker = (cb) =>
+                # are we done yet?
+                if Object.keys(cluster.workers).length == 0
+                    cb?()
+                    return false
 
-                    # grab a worker id off the stack
-                    id = Object.keys(cluster.workers)[0]
+                # grab a worker id off the stack
+                id = Object.keys(cluster.workers)[0]
 
-                    console.log "#{process.pid} STARTING #{id}"
+                console.log "#{process.pid} STARTING #{id}"
 
-                    @workers[id].rpc.request "send_listeners", (err,msg) =>
-                        if err
-                            @log.error "Worker hit error sending listeners during handoff: #{err}", error:err, worker:id
+                @workers[id].rpc.request "send_listeners", (err,msg) =>
+                    if err
+                        @log.error "Worker hit error sending listeners during handoff: #{err}", error:err, worker:id
 
-                        # tell the worker we're done with its services
-                        @workers[id].w.kill()
+                    # tell the worker we're done with its services
+                    @workers[id].w.kill()
 
-                        # do it again...
-                        _proxyWorker cb
+                    # do it again...
+                    _proxyWorker cb
 
-                _proxyWorker =>
-                    @log.event "Sent slave data to new process. Exiting."
+            _proxyWorker =>
+                @log.event "Sent slave data to new process. Exiting."
 
-                    # Exit
-                    process.exit()
-
-        # we need to pass over a copy of the server handle.  We ask the
-        # workers for it and go with the first one that comes back
-
-        _handleSent = false
-
-        if @_handle
-            _send @_handle
-        else
-            @_getHandleFromWorker (err,handle) =>
-                if err
-                    _send null
-                else
-                    _send handle
-
-    #----------
-
-    _getHandleFromWorker: (cb) ->
-        _sent = false
-
-        aF = _.after Object.keys(@lWorkers).length, =>
-            if !_sent
-                cb "Failed to get handle from any of our workers"
-
-        _askHandle = (id,w) =>
-            @log.debug "Asking worker #{id} for server handle"
-            w.rpc.request "send_handle", (err,msg,handle) =>
-                # error is going to be "I don't have a handle to send", so
-                # we'll just check whether we got a handle back
-                if handle? && !_sent
-                    _sent = true
-                    @log.debug "Worker #{id} replied with server handle"
-                    cb null, handle._handle
-
-                aF()
-
-        _askHandle(id,w) for id,w of @lWorkers
+                # Exit
+                process.exit()
 
     #----------
 

@@ -35,7 +35,7 @@ describe "Slave Mode", ->
             slave = s
 
             slave.once "full_strength", ->
-                slave_port = slave._lastAddress.port
+                slave_port = slave.slavePort()
                 expect(slave_port).to.not.be.undefined
                 expect(slave_port).to.be.number
                 done()
@@ -81,12 +81,6 @@ describe "Slave Mode", ->
                 done()
 
     describe "Worker Control", ->
-        it "can ask a worker for its handle", (done) ->
-            slave._getHandleFromWorker (err,handle) ->
-                throw new Error err if err
-                console.log "Handle is ", handle
-                done()
-
         it "can shut down a worker on request", (done) ->
             # get a worker id to shut down
             id = Object.keys(slave.workers)[0]
@@ -111,6 +105,6 @@ describe "Slave Mode", ->
                 done()
 
         it "should spawn a replacement worker", (done) ->
-            slave.once "worker_listening", ->
+            slave.once "worker_loaded", ->
                 expect(Object.keys(slave.workers)).to.have.length slave_config.cluster
                 done()

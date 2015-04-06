@@ -22,12 +22,19 @@ module.exports = class SlaveWorker
             # Slave calls this when it is looking for a handle to pass on
             # during handoff
             send_handle: (msg,handle,cb) =>
-                if @slave.server.hserver
+                if @slave.server.hserver?
+                    #console.log "Worker sending handle: ", @slave.server.hserver
                     cb null, null, @slave.server.hserver
                 else
                     cb new Error "Worker doesn't have a handle to send."
 
             #---
+
+            # Accept an incoming connection attempt
+            connection: (msg,sock,cb) =>
+                sock.allowHalfOpen = true
+                @slave.server.handle sock
+                cb null, "OK"
 
             # Accept a listener that we should now start serving
             land_listener: (msg,handle,cb) =>
@@ -44,24 +51,6 @@ module.exports = class SlaveWorker
 
                 , (err) =>
                     cb err
-
-            #---
-
-            # Request to start listening via either our config port or the
-            # included handle
-            listen: (msg,handle,cb) =>
-                listen_via = if msg.fd? then { fd:msg.fd } else @_config.port
-
-                @log.debug "Listen request via #{ listen_via }"
-
-                cb = _.once cb
-                @slave.server.once "error", (err) =>
-                    @log.error "SlaveWorker listen failed: #{err}"
-                    cb err
-
-                @slave.server.listen listen_via, =>
-                    @log.debug "SlaveWorker listening via #{ listen_via }."
-                    cb null, @slave.server.hserver.address()
 
             #---
 

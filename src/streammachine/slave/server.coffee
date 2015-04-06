@@ -4,6 +4,7 @@ util    = require 'util'
 fs      = require 'fs'
 path    = require 'path'
 uuid    = require 'node-uuid'
+http    = require "http"
 compression = require "compression"
 
 module.exports = class Server extends require('events').EventEmitter
@@ -16,6 +17,8 @@ module.exports = class Server extends require('events').EventEmitter
         # -- set up our express app -- #
 
         @app = express()
+        @_server = http.createServer @app
+
         @app.httpAllowHalfOpen = true
         @app.useChunkedEncodingByDefault = false
 
@@ -193,8 +196,8 @@ module.exports = class Server extends require('events').EventEmitter
     listen: (port,cb) ->
         @logger.info "SlaveWorker called listen"
         @hserver = @app.listen port, =>
-            @io = require("socket.io").listen @hserver
-            @emit "io_connected", @io
+            #@io = require("socket.io").listen @hserver
+            #@emit "io_connected", @io
             cb?(@hserver)
         @hserver
 
@@ -205,3 +208,7 @@ module.exports = class Server extends require('events').EventEmitter
         @hserver?.close => @logger.info "Slave server listening stopped."
 
     #----------
+
+    handle: (conn) ->
+        @_server.emit "connection", conn
+        conn.resume()
